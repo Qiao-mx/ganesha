@@ -1,0 +1,819 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+/*
+ * Copyright CEA/DAM/DIF  (2008)
+ * contributeur : Philippe DENIEL   philippe.deniel@cea.fr
+ *                Thomas LEIBOVICI  thomas.leibovici@cea.fr
+ *
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public License
+ * as published by the Free Software Foundation; either version 3 of
+ * the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
+ * 02110-1301 USA
+ *
+ * ---------------------------------------
+ */
+
+/**
+ * @addtogroup uid2grp
+ * @{
+ */
+
+/**
+ * @file uid2grp.c
+ * @brief Uid to group list conversion
+ */
+
+#include "config.h"
+#include "gsh_rpc.h"
+#include "nfs_core.h"
+#include <unistd.h> /* for using gethostname */
+#include <stdlib.h> /* for using exit */
+#include <strings.h>
+#include <string.h>
+#include <sys/types.h>
+#include <pwd.h>
+#include <grp.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include "common_utils.h"
+#include "uid2grp.h"
+#include "idmapper.h"
+#include "pwnam_wrappers.h"
+#ifdef USE_NFSIDMAP
+#include <nfsidmap.h>
+#endif
+#include "idmapper_monitoring.h"
+
+#include "gsh_lttng/gsh_lttng.h"
+#if defined(USE_LTTNG) && !defined(LTTNG_PARSING)
+#include "gsh_lttng/generated_traces/uid2grp.h"
+#endif
+
+/* Switch to enable or disable idmapping */
+extern bool idmapping_enabled;
+
+sem_t uid2grp_sem;
+
+/* group_data has a reference counter. If it goes to zero, it implies
+ * that it is out of the cache (AVL trees) and should be freed. The
+ * reference count is 1 when we put it into AVL trees. We decrement when
+ * we take it out of AVL trees. Also incremented when we pass this to
+ * out siders (uid2grp and friends) and decremented when they are done
+ * (in uid2grp_unref()).
+ *
+ * When a group_data needs to be removed or expired after a certain
+ * timeout, we take it out of the cache (AVL trees). When everyone using
+ * the group_data are done, the refcount will go to zero at which point
+ * we free group_data as well as the buffer holding supplementary
+ * groups.
+ */
+void uid2grp_hold_group_data(struct group_data *gdata)
+{
+	PTHREAD_MUTEX_lock(&gdata->gd_lock);
+	gdata->refcount++;
+	PTHREAD_MUTEX_unlock(&gdata->gd_lock);
+}
+
+void uid2grp_release_group_data(struct group_data *gdata)
+{
+	unsigned int refcount;
+
+	PTHREAD_MUTEX_lock(&gdata->gd_lock);
+	refcount = --gdata->refcount;
+	PTHREAD_MUTEX_unlock(&gdata->gd_lock);
+
+	if (refcount == 0) {
+		PTHREAD_MUTEX_destroy(&gdata->gd_lock);
+		gsh_free(gdata->groups);
+		gsh_free(gdata);
+	} else if (refcount == (unsigned int)-1) {
+		LogCrit(COMPONENT_IDMAPPER, "negative refcount on gdata: %p",
+			gdata);
+		GSH_AUTO_TRACEPOINT(uid2grp, negative_refcount, TRACE_ERR,
+				    "negative refcount on gdata");
+	}
+}
+
+/* Allocate supplementary groups buffer */
+static bool my_getgrouplist_alloc(char *user, gid_t gid,
+				  struct group_data *gdata)
+{
+	const int max_groups_membership =
+		nfs_param.directory_services_param.max_groups_membership;
+	int ngroups = MIN(1000, max_groups_membership);
+	gid_t *groups = NULL;
+	struct timespec s_time, e_time;
+	bool stats = nfs_param.core_param.enable_AUTHSTATS;
+	int ret;
+
+	/* We call getgrouplist() with ngroups set to 1000 first. This should
+	 * reduce the number of getgrouplist() calls made to 1, for most cases.
+	 * However, getgrouplist() return -1 if the actual number of groups the
+	 * user is in, is more than 1000 (very rare) and ngroups will be set to
+	 * the actual number of groups the user is in. We can then make a second
+	 * query to fetch all the groups when ngroups is greater than 1000.
+	 *
+	 * The manpage doesn't say anything about errno value, it was usually
+	 * zero but was set to 34 (ERANGE) under some environments. ngroups was
+	 * set correctly no matter what the errno value is!
+	 * We assume that ngroups is correctly set, no matter what the
+	 * errno value is. The man page says, "The ngroups argument
+	 * is a value-result argument: on  return  it always contains
+	 * the  number  of  groups found for user."
+	 */
+	groups = gsh_malloc(ngroups * sizeof(gid_t));
+
+	now(&s_time);
+	ret = pwnam_wrappers__getgrouplist(user, gid, groups, &ngroups);
+	now(&e_time);
+	idmapper_monitoring__external_request(IDMAPPING_USERNAME_TO_GROUPLIST,
+					      IDMAPPING_PWUTILS, ret == 0,
+					      &s_time, &e_time);
+	GSH_AUTO_TRACEPOINT(uid2grp, getgrouplist_call, TRACE_INFO,
+			    "getgrouplist returned {}, ngroups={} ", ret,
+			    ngroups);
+
+	if (ret != 0) {
+		LogEvent(COMPONENT_IDMAPPER,
+			 "getgrouplist for user: %s failed, errno: %d, retrying", user, ret);
+		GSH_AUTO_TRACEPOINT(uid2grp, getgrouplist_failed, TRACE_INFO,
+				    "getgrouplist for user: {} failed, errno: {}, retrying",
+				    TP_STR(user), ret);
+
+		gsh_free(groups);
+
+		/* Try with the actual ngroups if user is part of more than 1000
+		 * groups. */
+		if (ngroups > max_groups_membership) {
+			ngroups = max_groups_membership;
+			idmapper_monitoring__max_groups_exceeded_inc();
+		}
+		groups = gsh_malloc(ngroups * sizeof(gid_t));
+
+		now(&s_time);
+		ret = pwnam_wrappers__getgrouplist(user, gid, groups, &ngroups);
+		now(&e_time);
+		idmapper_monitoring__external_request(
+			IDMAPPING_USERNAME_TO_GROUPLIST, IDMAPPING_PWUTILS,
+			ret == 0, &s_time, &e_time);
+
+		if (ret != 0) {
+			LogWarn(COMPONENT_IDMAPPER,
+				"getgrouplist for user:%s failed, ngroups: %d, errno: %d",
+				user, ngroups, ret);
+			GSH_AUTO_TRACEPOINT(
+				uid2grp, getgrouplist_retry_failed,
+				TRACE_WARNING,
+				"getgrouplist for user:{} failed, ngroups: {}, errno: {}",
+				TP_STR(user), ngroups, ret);
+			gsh_free(groups);
+			return false;
+		}
+
+		if (stats) {
+			gc_stats_update(&s_time, &e_time);
+			stats = false;
+		}
+	}
+
+	idmapper_monitoring__user_groups(ngroups);
+	LogInfo(COMPONENT_IDMAPPER,
+		"getgrouplist for uname: %s, returned %d groups", user,
+		ngroups);
+	GSH_AUTO_TRACEPOINT(uid2grp, getgrouplist_result, TRACE_INFO,
+			    "getgrouplist for user: {} returned groups: {}",
+			    TP_STR(user), TP_INT_ARR(groups, ngroups));
+
+	/* Resize or free the buffer as appropriate */
+	if (ngroups != 0) {
+		/* Resize the buffer, if it fails, gsh_realloc will
+		 * abort.
+		 */
+		groups = gsh_realloc(groups, ngroups * sizeof(gid_t));
+	} else {
+		/* We need to free groups because later code may not. */
+		gsh_free(groups);
+		groups = NULL;
+	}
+
+	if (stats)
+		gc_stats_update(&s_time, &e_time);
+	gdata->groups = groups;
+	gdata->nbgroups = ngroups;
+
+	return true;
+}
+
+/* Allocate and fill in group_data structure */
+static struct group_data *
+uid2grp_allocate_by_name(const struct gsh_buffdesc *name)
+{
+	struct passwd p;
+	struct passwd *pp;
+	char *namebuff = alloca(name->len + 1);
+	struct group_data *gdata = NULL;
+	char *buff;
+	size_t buff_size;
+	int retval;
+	struct timespec s_time, e_time;
+	size_t uname_len;
+
+	memcpy(namebuff, name->addr, name->len);
+	*(namebuff + name->len) = '\0';
+
+	buff_size = sysconf(_SC_GETPW_R_SIZE_MAX);
+	if (buff_size == -1) {
+		LogMajor(COMPONENT_IDMAPPER, "sysconf failure: %d", errno);
+		buff_size = PWENT_BEST_GUESS_LEN;
+	}
+
+	while (buff_size <= PWENT_MAX_SIZE) {
+		buff = gsh_malloc(buff_size);
+		now_mono(&s_time);
+		retval = pwnam_wrappers__getpwnam_r(namebuff, &p, buff,
+						    buff_size, &pp);
+		now_mono(&e_time);
+		idmapper_monitoring__external_request(
+			IDMAPPING_USERNAME_TO_UIDGID, IDMAPPING_PWUTILS,
+			retval == 0, &s_time, &e_time);
+		GSH_AUTO_TRACEPOINT(
+			uid2grp, getpwnam_r_call, TRACE_INFO,
+			"getpwnam_r returned: {} for uname: {}", retval,
+			TP_BYTE_ARR_TRUNCATED(name->addr, name->len));
+
+		if (retval != ERANGE)
+			break;
+		gsh_free(buff);
+		buff_size *= 16;
+	}
+
+	if (retval == ERANGE) {
+		LogWarn(COMPONENT_IDMAPPER,
+			"Received ERANGE when fetching pw-entry from name: %s",
+			namebuff);
+		GSH_AUTO_TRACEPOINT(
+			uid2grp, getpwnam_r_failed, TRACE_INFO,
+			"getpwnam_r for uname={} failed with ERANGE",
+			TP_BYTE_ARR_TRUNCATED(name->addr, name->len));
+		return NULL;
+	}
+
+	if (retval != 0) {
+		LogEvent(COMPONENT_IDMAPPER,
+			 "getpwnam_r for %s failed, error %d", namebuff,
+			 retval);
+		GSH_AUTO_TRACEPOINT(
+			uid2grp, getpwnam_r_failed1, TRACE_INFO,
+			"getpwnam_r for uname={} failed, retval={}",
+			TP_BYTE_ARR_TRUNCATED(name->addr, name->len), retval);
+		goto out;
+	}
+	if (pp == NULL) {
+		LogEvent(COMPONENT_IDMAPPER,
+			 "No matching password record found for name %s",
+			 namebuff);
+		GSH_AUTO_TRACEPOINT(
+			uid2grp, no_passwd_record, TRACE_INFO,
+			"No matching password record found for uname {}",
+			TP_BYTE_ARR_TRUNCATED(name->addr, name->len));
+		goto out;
+	}
+
+	uname_len = strlen(p.pw_name);
+	LogInfo(COMPONENT_IDMAPPER, "getpwnam_r for uname: %s, uid: %d gid: %d",
+		namebuff, p.pw_uid, p.pw_gid);
+	GSH_AUTO_TRACEPOINT(uid2grp, getpwnam_r_call1, TRACE_INFO,
+			    "getpwnam_r for uid: {}, gid: {}, uname: {}",
+			    p.pw_uid, p.pw_gid,
+			    TP_BYTE_ARR_TRUNCATED(p.pw_name, uname_len));
+
+	gdata = gsh_malloc(sizeof(struct group_data) + uname_len);
+	gdata->uname.len = uname_len;
+	gdata->uname.addr = (char *)gdata + sizeof(struct group_data);
+	memcpy(gdata->uname.addr, p.pw_name, gdata->uname.len);
+	gdata->uid = p.pw_uid;
+	gdata->gid = p.pw_gid;
+
+	/* Throttle getgrouplist queries to Directory Server if required. */
+	if (nfs_param.core_param.max_uid_to_grp_reqs)
+		sem_wait(&uid2grp_sem);
+
+	if (!my_getgrouplist_alloc(p.pw_name, p.pw_gid, gdata)) {
+		gsh_free(gdata);
+		gdata = NULL;
+		if (nfs_param.core_param.max_uid_to_grp_reqs)
+			sem_post(&uid2grp_sem);
+		goto out;
+	}
+
+	if (nfs_param.core_param.max_uid_to_grp_reqs)
+		sem_post(&uid2grp_sem);
+
+	PTHREAD_MUTEX_init(&gdata->gd_lock, NULL);
+	gdata->epoch = time(NULL);
+	gdata->refcount = 0;
+
+out:
+	gsh_free(buff);
+	return gdata;
+}
+
+/* Allocate and fill in group_data structure */
+static struct group_data *uid2grp_allocate_by_uid(uid_t uid)
+{
+	struct passwd p;
+	struct passwd *pp;
+	struct group_data *gdata = NULL;
+	char *buff;
+	size_t buff_size;
+	int retval;
+	struct timespec s_time, e_time;
+	size_t uname_len;
+
+	buff_size = sysconf(_SC_GETPW_R_SIZE_MAX);
+	if (buff_size == -1) {
+		LogMajor(COMPONENT_IDMAPPER, "sysconf failure: %d", errno);
+		buff_size = PWENT_BEST_GUESS_LEN;
+	}
+
+	while (buff_size <= PWENT_MAX_SIZE) {
+		buff = gsh_malloc(buff_size);
+		now_mono(&s_time);
+		retval = pwnam_wrappers__getpwuid_r(uid, &p, buff, buff_size,
+						    &pp);
+		now_mono(&e_time);
+		idmapper_monitoring__external_request(IDMAPPING_UID_TO_UNAME,
+						      IDMAPPING_PWUTILS,
+						      retval == 0, &s_time,
+						      &e_time);
+
+		GSH_AUTO_TRACEPOINT(uid2grp, getpwuid_r_call, TRACE_INFO,
+				    "getpwuid_r returned: {} for uid: {}",
+				    retval, uid);
+
+		if (retval != ERANGE)
+			break;
+		gsh_free(buff);
+		buff_size *= 16;
+	}
+
+	if (retval == ERANGE) {
+		LogWarn(COMPONENT_IDMAPPER,
+			"Received ERANGE when fetching pw-entry from uid: %u",
+			uid);
+		GSH_AUTO_TRACEPOINT(uid2grp, getpwuid_r_failed, TRACE_INFO,
+				    "getpwuid_r for uid={} failed with ERANGE",
+				    uid);
+		return NULL;
+	}
+
+	if (retval != 0) {
+		LogEvent(COMPONENT_IDMAPPER,
+			 "getpwuid_r for uid %u failed, error %d", uid, retval);
+		GSH_AUTO_TRACEPOINT(uid2grp, getpwuid_r_failed1, TRACE_INFO,
+				    "getpwuid_r for uid={} failed, retval={}",
+				    uid, retval);
+		goto out;
+	}
+	if (pp == NULL) {
+		LogInfo(COMPONENT_IDMAPPER,
+			"No matching password record found for uid %u", uid);
+		GSH_AUTO_TRACEPOINT(
+			uid2grp, no_passwd_record1, TRACE_INFO,
+			"No matching password record found for uid {}", uid);
+		goto out;
+	}
+
+	uname_len = strlen(p.pw_name);
+	LogInfo(COMPONENT_IDMAPPER,
+		"getpwuid_r for uid: %d, gid: %d, uname: %s", p.pw_uid,
+		p.pw_gid, p.pw_name);
+	GSH_AUTO_TRACEPOINT(uid2grp, getpwuid_r_call1, TRACE_INFO,
+			    "getpwuid_r for uid: {}, gid: {}, uname: {}", uid,
+			    p.pw_gid,
+			    TP_BYTE_ARR_TRUNCATED(p.pw_name, uname_len));
+
+	gdata = gsh_malloc(sizeof(struct group_data) + uname_len);
+	gdata->uname.len = uname_len;
+	gdata->uname.addr = (char *)gdata + sizeof(struct group_data);
+	memcpy(gdata->uname.addr, p.pw_name, gdata->uname.len);
+	gdata->uid = p.pw_uid;
+	gdata->gid = p.pw_gid;
+
+	/* Throttle getgrouplist queries to Directory Server if required. */
+	if (nfs_param.core_param.max_uid_to_grp_reqs)
+		sem_wait(&uid2grp_sem);
+
+	if (!my_getgrouplist_alloc(p.pw_name, p.pw_gid, gdata)) {
+		gsh_free(gdata);
+		gdata = NULL;
+		if (nfs_param.core_param.max_uid_to_grp_reqs)
+			sem_post(&uid2grp_sem);
+		goto out;
+	}
+
+	if (nfs_param.core_param.max_uid_to_grp_reqs)
+		sem_post(&uid2grp_sem);
+
+	PTHREAD_MUTEX_init(&gdata->gd_lock, NULL);
+	gdata->epoch = time(NULL);
+	gdata->refcount = 0;
+
+out:
+	gsh_free(buff);
+	return gdata;
+}
+
+/**
+ * @brief Allocate supplementary groups using principal
+ *
+ * @note This function uses libnfsidmap internally
+ *
+ * @param[in]  principal The principal name
+ * @param[in]  uid       The uid of user represented by the principal
+ * @param[in]  gid       The gid of user represented by the principal
+ *
+ * @return group_data with fetched groups. It can be NULL on lookup or
+ * allocation failures.
+ */
+static struct group_data *uid2grp_allocate_by_principal(char *principal,
+							uid_t uid, gid_t gid)
+{
+#ifdef USE_NFSIDMAP
+	struct group_data *grpdata = NULL;
+	const int default_ngroups = 1000;
+	const int max_groups_membership =
+		nfs_param.directory_services_param.max_groups_membership;
+	int ngroups = MIN(default_ngroups, max_groups_membership);
+	gid_t *groups = NULL;
+	int ret;
+	struct timespec s_time, e_time;
+	size_t principal_len;
+
+#ifdef _MSPAC_SUPPORT
+	/* TODO */
+	LogWarn(COMPONENT_IDMAPPER, "Unsupported code path for principal %s",
+		principal);
+	return NULL;
+#endif
+
+	/* We call nfs4_gss_princ_to_grouplist() with ngroups set to 1000 first.
+	 * This should reduce number of nfs4_gss_princ_to_grouplist() calls made
+	 * to 1, for most cases. However, nfs4_gss_princ_to_grouplist() returns
+	 * -ERANGE if the actual number of groups the user is in, is more
+	 * than 1000 (very rare) and ngroups will be set to the actual number of
+	 * groups the user is in. We can then make a second query to fetch all
+	 * the groups when ngroups is greater than 1000.
+	 */
+	groups = gsh_malloc(ngroups * sizeof(gid_t));
+	now_mono(&s_time);
+	ret = nfs4_gss_princ_to_grouplist("krb5", principal, groups, &ngroups);
+	now_mono(&e_time);
+	idmapper_monitoring__external_request(IDMAPPING_PRINCIPAL_TO_GROUPLIST,
+					      IDMAPPING_NFSIDMAP, ret == 0,
+					      &s_time, &e_time);
+
+	if (ret == -ERANGE) {
+		/* Try with the actual ngroups since user is part of more than
+		 * 1000 groups
+		 */
+		gsh_free(groups);
+		if (ngroups > max_groups_membership) {
+			ngroups = max_groups_membership;
+			idmapper_monitoring__max_groups_exceeded_inc();
+		}
+		groups = gsh_malloc(ngroups * sizeof(gid_t));
+
+		now_mono(&s_time);
+		ret = nfs4_gss_princ_to_grouplist("krb5", principal, groups,
+						  &ngroups);
+		now_mono(&e_time);
+		idmapper_monitoring__external_request(
+			IDMAPPING_PRINCIPAL_TO_GROUPLIST, IDMAPPING_NFSIDMAP,
+			ret == 0, &s_time, &e_time);
+		if (ret) {
+			if (ret == -ERANGE) {
+				LogWarn(COMPONENT_IDMAPPER,
+					"Could not re-resolve principal %s to groups using nfsidmap, user has more groups than the allowed limit",
+					principal);
+			} else {
+				LogWarn(COMPONENT_IDMAPPER,
+					"Could not re-resolve principal %s to groups using nfsidmap, err: %d",
+					principal, ret);
+			}
+			gsh_free(groups);
+			return NULL;
+		}
+	} else if (ret) {
+		LogWarn(COMPONENT_IDMAPPER,
+			"Could not resolve principal %s to groups using nfsidmap, err: %d",
+			principal, ret);
+		gsh_free(groups);
+		return NULL;
+	}
+	LogDebug(COMPONENT_IDMAPPER,
+		 "Resolved principal %s to %d groups using nfsidmap", principal,
+		 ngroups);
+
+	idmapper_monitoring__user_groups(ngroups);
+
+	/* Resize or free the buffer as appropriate */
+	if (ngroups != 0) {
+		/* Resize the buffer, if it fails, gsh_realloc will
+		 * abort.
+		 */
+		groups = gsh_realloc(groups, ngroups * sizeof(gid_t));
+	} else {
+		/* We need to free groups because later code may not. */
+		gsh_free(groups);
+		groups = NULL;
+	}
+
+	principal_len = strlen(principal);
+	grpdata = gsh_malloc(sizeof(struct group_data) + principal_len + 1);
+	/* We populate principal as the uname here */
+	grpdata->uname.len = principal_len;
+	grpdata->uname.addr = (char *)grpdata + sizeof(struct group_data);
+	memcpy(grpdata->uname.addr, principal, grpdata->uname.len);
+	/* Null-terminate the uname string */
+	((char *)grpdata->uname.addr)[grpdata->uname.len] = 0;
+	grpdata->uid = uid;
+	grpdata->gid = gid;
+	grpdata->groups = groups;
+	grpdata->nbgroups = ngroups;
+	PTHREAD_MUTEX_init(&grpdata->gd_lock, NULL);
+	grpdata->epoch = time(NULL);
+	grpdata->refcount = 0;
+
+	return grpdata;
+#else
+	LogWarn(COMPONENT_IDMAPPER, "Invalid code path");
+	return NULL;
+#endif
+}
+
+/**
+ * @brief Add a user entry to the cache
+ *
+ * @param[in] group_data user entry with allocated supplementary groups
+ */
+static void add_user_groups_to_cache(struct group_data **gdata)
+{
+	/* Do not add to cache if idmapping is disabled */
+	if (!idmapping_enabled) {
+		LogWarn(COMPONENT_IDMAPPER,
+			"Idmapping is disabled, add-to-cache skipped");
+		return;
+	}
+
+	PTHREAD_RWLOCK_wrlock(&uid2grp_user_lock);
+
+	/* Re-check if idmapping is enabled because it is possible that after
+	 * cache cleanup completes (resulting from the disabling of idmapping),
+	 * there are waiting requests with older idmapping data that might end
+	 * up writing their data to the cache. We need to stop them.
+	*/
+	if (!idmapping_enabled) {
+		PTHREAD_RWLOCK_unlock(&uid2grp_user_lock);
+		LogWarn(COMPONENT_IDMAPPER,
+			"Idmapping is disabled, add-to-cache skipped");
+		return;
+	}
+	uid2grp_add_user(*gdata);
+	uid2grp_hold_group_data(*gdata);
+	PTHREAD_RWLOCK_unlock(&uid2grp_user_lock);
+}
+
+/**
+ * @brief Get supplementary groups given uname
+ *
+ * @param[in]  name       The name of the user
+ * @param[out] group_data The group data of the user
+ *
+ * @return true if successful, false otherwise
+ */
+bool uname2grp(const struct gsh_buffdesc *name, struct group_data **gdata)
+{
+	bool success = false;
+	bool is_cache_hit = false;
+	uid_t uid = -1;
+
+	if (!idmapping_enabled) {
+		LogWarn(COMPONENT_IDMAPPER,
+			"Idmapping is disabled, name-to-group skipped");
+		return false;
+	}
+
+	PTHREAD_RWLOCK_rdlock(&uid2grp_user_lock);
+	success = uid2grp_lookup_by_uname(name, &uid, gdata);
+	is_cache_hit = success && !uid2grp_is_group_data_expired(*gdata);
+	idmapper_monitoring__cache_usage(IDMAPPING_USER_GROUPS_CACHE,
+					 is_cache_hit);
+
+	if (is_cache_hit) {
+		/* Return success if we find non-expired group-data in cache */
+		uid2grp_hold_group_data(*gdata);
+		PTHREAD_RWLOCK_unlock(&uid2grp_user_lock);
+		return true;
+	}
+	PTHREAD_RWLOCK_unlock(&uid2grp_user_lock);
+
+	/* We could not find non-expired group-data in cache, fetch it afresh */
+	*gdata = uid2grp_allocate_by_name(name);
+	if (*gdata) {
+		/* This will also remove existing expired cache entry */
+		add_user_groups_to_cache(gdata);
+		return true;
+	}
+
+	/*
+	 * At this point, we could not find non-expired group-data in cache,
+	 * and we also weren't able to fetch fresh group-data.
+	 * If the group-data in cache is expired, we stll want to remove it.
+	 */
+	if (success) {
+		/* Remove expired cache entry */
+		PTHREAD_RWLOCK_wrlock(&uid2grp_user_lock);
+		uid2grp_remove_expired_by_uname(name);
+		PTHREAD_RWLOCK_unlock(&uid2grp_user_lock);
+	}
+	return false;
+}
+
+/**
+ * @brief Add uid to the idmapper-user negative cache
+ *
+ * @param[in] uid      uid
+ */
+static void add_uid_to_negative_cache(uid_t uid)
+{
+	if (!idmapping_enabled) {
+		LogWarn(COMPONENT_IDMAPPER,
+			"Idmapping is disabled. Add uid to negative cache skipped.");
+		return;
+	}
+	PTHREAD_RWLOCK_wrlock(&idmapper_negative_cache_uid_lock);
+
+	/* Recheck after obtaining the lock */
+	if (!idmapping_enabled) {
+		PTHREAD_RWLOCK_unlock(&idmapper_negative_cache_uid_lock);
+		LogWarn(COMPONENT_IDMAPPER,
+			"Idmapping is disabled. Add uid to negative cache skipped.");
+		return;
+	}
+	idmapper_negative_cache_add_user_by_uid(uid);
+	PTHREAD_RWLOCK_unlock(&idmapper_negative_cache_uid_lock);
+}
+
+/**
+ * @brief Get supplementary groups given uid
+ *
+ * @param[in]   uid        The uid of the user
+ * @param[out]  group_data The group data of the user
+ *
+ * @return true if successful, false otherwise
+ */
+bool uid2grp(uid_t uid, struct group_data **gdata)
+{
+	bool success = false;
+	bool is_cache_hit = false;
+	bool is_negative_cache_hit = false;
+
+	if (!idmapping_enabled) {
+		LogWarn(COMPONENT_IDMAPPER,
+			"Idmapping is disabled, uid-to-group skipped");
+		return false;
+	}
+
+	PTHREAD_RWLOCK_rdlock(&uid2grp_user_lock);
+	success = uid2grp_lookup_by_uid(uid, gdata);
+	is_cache_hit = success && !uid2grp_is_group_data_expired(*gdata);
+	idmapper_monitoring__cache_usage(IDMAPPING_USER_GROUPS_CACHE,
+					 is_cache_hit);
+
+	if (is_cache_hit) {
+		/* Return success if we find non-expired group-data in cache */
+		uid2grp_hold_group_data(*gdata);
+		PTHREAD_RWLOCK_unlock(&uid2grp_user_lock);
+		return true;
+	}
+	PTHREAD_RWLOCK_unlock(&uid2grp_user_lock);
+
+	/* Lookup negative cache */
+	PTHREAD_RWLOCK_rdlock(&idmapper_negative_cache_uid_lock);
+	is_negative_cache_hit = idmapper_negative_cache_lookup_user_by_uid(uid);
+	PTHREAD_RWLOCK_unlock(&idmapper_negative_cache_uid_lock);
+	if (is_negative_cache_hit)
+		return false;
+
+	/* We could not find non-expired group-data in cache,
+	 * nor in the negative cache, fetch it afresh */
+	*gdata = uid2grp_allocate_by_uid(uid);
+	if (*gdata) {
+		/* This will also remove existing expired cache entry */
+		add_user_groups_to_cache(gdata);
+		return true;
+	}
+
+	/*
+	 * At this point, we could not find non-expired group-data in cache,
+	 * and we also weren't able to fetch fresh group-data.
+	 * If the group-data in cache is expired, we still want to remove it.
+	 */
+	if (success) {
+		/* Remove expired cache entry */
+		PTHREAD_RWLOCK_wrlock(&uid2grp_user_lock);
+		uid2grp_remove_expired_by_uid(uid);
+		PTHREAD_RWLOCK_unlock(&uid2grp_user_lock);
+	}
+	/* We couldn't find that uid, place it in the negative cache */
+	add_uid_to_negative_cache(uid);
+	return false;
+}
+
+/**
+ * @brief Get supplementary groups given principal
+ *
+ * @note This function internally uses libnfsidmap functions
+ *
+ * @param[in]  principal The principal name
+ * @param[in]  uid       The uid of user represented by the principal
+ * @param[in]  gid       The gid of user represented by the principal
+ * @param[out] gdata     Filled group_data structure containing user groups
+ *
+ * @return true if successful, false otherwise
+ */
+bool principal2grp(char *principal, struct group_data **gdata, const uid_t uid,
+		   const gid_t gid)
+{
+	bool success = false;
+	bool is_cache_hit = false;
+	uid_t unused_cached_uid = -1;
+	struct gsh_buffdesc princbuff = { .addr = principal,
+					  .len = strlen(principal) };
+	LogDebug(COMPONENT_IDMAPPER, "Resolve principal %s to groups",
+		 principal);
+
+	if (!idmapping_enabled) {
+		LogWarn(COMPONENT_IDMAPPER,
+			"Idmapping is disabled, principal-to-group skipped");
+		return false;
+	}
+
+	PTHREAD_RWLOCK_rdlock(&uid2grp_user_lock);
+	success =
+		uid2grp_lookup_by_uname(&princbuff, &unused_cached_uid, gdata);
+	is_cache_hit = success && !uid2grp_is_group_data_expired(*gdata);
+	idmapper_monitoring__cache_usage(IDMAPPING_USER_GROUPS_CACHE,
+					 is_cache_hit);
+
+	if (is_cache_hit) {
+		/* Return success if we find non-expired group-data in cache */
+		uid2grp_hold_group_data(*gdata);
+		PTHREAD_RWLOCK_unlock(&uid2grp_user_lock);
+		return true;
+	}
+	PTHREAD_RWLOCK_unlock(&uid2grp_user_lock);
+
+	/* We could not find non-expired group-data in cache, fetch it afresh */
+	*gdata = uid2grp_allocate_by_principal(principal, uid, gid);
+	if (*gdata) {
+		/* This will also remove existing expired cache entry */
+		add_user_groups_to_cache(gdata);
+		return true;
+	}
+
+	/*
+	 * At this point, we could not find non-expired group-data in cache,
+	 * and we also weren't able to fetch fresh group-data.
+	 * If the group-data in cache is expired, we still want to remove it.
+	 */
+	if (success) {
+		/* Remove expired cache entry */
+		PTHREAD_RWLOCK_wrlock(&uid2grp_user_lock);
+		uid2grp_remove_expired_by_uname(&princbuff);
+		PTHREAD_RWLOCK_unlock(&uid2grp_user_lock);
+	}
+	return false;
+}
+
+/*
+ * All callers of uid2grp(), uname2grp() and principal2grp() must call
+ * this when they are done accessing supplementary groups
+ */
+void uid2grp_unref(struct group_data *gdata)
+{
+	uid2grp_release_group_data(gdata);
+}
+
+/** @} */
